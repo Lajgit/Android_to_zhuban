@@ -176,17 +176,18 @@ static void Motor2_SetCompare(uint32_t Channel, uint16_t Percent)
 
 static void Motor2_RunForward(void)
 {
-    /* 硬件定义：PA6/TIM3_CH1接FI，PA7/TIM3_CH2接BI。 */
-    Motor2_SetCompare(TIM_CHANNEL_1, MOTOR2_SPEED);
-    Motor2_SetCompare(TIM_CHANNEL_2, 0U);
+    /* 实机确认原方向相反：正常吐珠时PA7/BI输出PWM，PA6/FI保持低电平。 */
+    Motor2_SetCompare(TIM_CHANNEL_1, 0U);
+    Motor2_SetCompare(TIM_CHANNEL_2, MOTOR2_SPEED);
     Motor2RuntimeTick = HAL_GetTick();
     Motor2State = MOTOR2_STATE_BUSY;
 }
 
 static void Motor2_RunReverse(void)
 {
-    Motor2_SetCompare(TIM_CHANNEL_1, 0U);
-    Motor2_SetCompare(TIM_CHANNEL_2, MOTOR2_SPEED);
+    /* 堵珠反转与正常吐珠方向相反。 */
+    Motor2_SetCompare(TIM_CHANNEL_1, MOTOR2_SPEED);
+    Motor2_SetCompare(TIM_CHANNEL_2, 0U);
 }
 
 static void Motor2_Brake(void)
