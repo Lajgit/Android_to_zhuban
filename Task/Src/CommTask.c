@@ -1,146 +1,662 @@
 #include "CommTask.h"
-#include "MesgTask.h"
-#include "KeyTask.h"
 #include "MainTask.h"
-#include "LightTask.h"
-#include "FlashTask.h"
 #include "app_crc.h"
-#include "app_list.h"
-#include "port_digitaltube.h"
 #include "string.h"
+#include "tim.h"
 #include "usart.h"
 
 #define Mesg_Head 0xAA
 #define Mesg_Tail 0x55
+#define RELAY_FRAME_LEN 14U
+#define UART_QUEUE_SIZE 1024U
+#define UART_QUEUE_MASK (UART_QUEUE_SIZE - 1U)
+#define UART_FORWARD_CHUNK 64U
+#define MOTOR2_SPEED 85U
+#define MOTOR2_TIMEOUT_MS 3000U
+#define MOTOR2_REVERSE_MS 300U
+#define MOTOR2_REVERSE_DELAY_MS 1U
+#define MOTOR2_RETRY_TIMES 3U
+#define MOTOR2_VALID_PULSE_US 100U
+#define LOCAL_DEDUP_COUNT 16U
+#define LOCAL_DEDUP_TIME_MS 5000U
+#define RAW_EXIT_MIN_TIME_MS 500U
 
-static uint8_t rx_buffer[256];
-static Mesg_TypeDef Receive_mesg;
+typedef enum
+{
+    RELAY_MODE_NORMAL = 0,
+    RELAY_MODE_RAW
+} RelayMode_t;
 
+typedef enum
+{
+    MOTOR2_STATE_IDLE = 0,
+    MOTOR2_STATE_BUSY,
+    MOTOR2_STATE_REVERSE_DELAY,
+    MOTOR2_STATE_REVERSING
+} Motor2State_t;
+
+typedef struct
+{
+    volatile uint16_t Read;
+    volatile uint16_t Write;
+    uint8_t Buffer[UART_QUEUE_SIZE];
+} ByteQueue_t;
+
+typedef struct
+{
+    uint8_t Valid;
+    uint8_t ID;
+    uint8_t Code2;
+    uint32_t Tick;
+} LocalDedupe_t;
+
+/* 兼容旧控台文件保留，新的转发逻辑不再使用旧Rx解析器。 */
 Tx_HandleTypeDef Tx;
 Rx_HandleTypeDef Rx;
 
-extern Event_Handle_t Mesg_event;
-extern DigitalTube_t DigitalTube;
-extern Light_t Light1;
-extern BreathLight_t *BreathList[];
-extern uint8_t LightBelt_Lightness;
-extern uint8_t LightBoard_Lightness;
-extern uint8_t Switch_ID;
-extern Scene_t Scene;
-extern Light_t Light1, Light2;
+static ByteQueue_t AndroidRxQueue;
+static ByteQueue_t MainBoardRxQueue;
+static uint8_t AndroidRxByte;
+static uint8_t MainBoardRxByte;
+static RelayMode_t RelayMode = RELAY_MODE_NORMAL;
+static uint32_t RawModeEnterTick;
+static uint8_t AndroidFrame[RELAY_FRAME_LEN];
+static uint8_t AndroidFrameIndex;
+static uint8_t RawProbeFrame[RELAY_FRAME_LEN];
+static uint8_t RawProbeIndex;
+static LocalDedupe_t LocalDedupe[LOCAL_DEDUP_COUNT];
+static volatile uint16_t Motor2RemainingCount;
+static volatile uint8_t Motor2RetryCount;
+static volatile uint8_t Motor2PulseStarted;
+static volatile uint8_t Motor2StopRequested;
+static volatile uint8_t Motor2RemainingReportPending;
+static volatile uint8_t Motor2TimeoutReportPending;
+static Motor2State_t Motor2State = MOTOR2_STATE_IDLE;
+static uint32_t Motor2RuntimeTick;
+static uint32_t Motor2PhaseTick;
+static uint8_t RelayTxID;
+static uint8_t LegacyTxID;
 
-/// 串口消息验证
-static bool USART_ReceiveMesg_Verify(void *self, void *mesg)
+static uint8_t ByteQueue_Push(ByteQueue_t *Queue, uint8_t Data)
 {
-    Rx_HandleTypeDef *rx = (Rx_HandleTypeDef *)self;
-    Mesg_TypeDef *Rx_mesg = (Mesg_TypeDef *)mesg;
-    uint16_t crc16, mesg_crc16;
-    crc16 = CRC16_calculate(rx->Queue.Buf, 11);
-    mesg_crc16 = Rx_mesg->CRC16_H << 8 | Rx_mesg->CRC16_L;
-    if (crc16 == mesg_crc16)
-        return true;
-    return false;
+    uint16_t next = (uint16_t)((Queue->Write + 1U) & UART_QUEUE_MASK);
+    if (next == Queue->Read)
+        return 0U;
+    Queue->Buffer[Queue->Write] = Data;
+    Queue->Write = next;
+    return 1U;
 }
-/// 串口1消息处理
-static void USART_Deal(void *Rx_mesg)
+
+static uint8_t ByteQueue_Pop(ByteQueue_t *Queue, uint8_t *Data)
 {
-    Mesg_TypeDef *mesg = (Mesg_TypeDef *)Rx_mesg;
-    if (mesg->Code1 == Board_to_Ctrl)
+    if (Queue->Read == Queue->Write)
+        return 0U;
+    *Data = Queue->Buffer[Queue->Read];
+    Queue->Read = (uint16_t)((Queue->Read + 1U) & UART_QUEUE_MASK);
+    return 1U;
+}
+
+static uint16_t ByteQueue_Read(ByteQueue_t *Queue, uint8_t *Data, uint16_t MaxLen)
+{
+    uint16_t len = 0U;
+    while ((len < MaxLen) && (ByteQueue_Pop(Queue, &Data[len]) != 0U))
+        len++;
+    return len;
+}
+
+static uint8_t Relay_FrameVerify(const uint8_t *Frame)
+{
+    uint16_t crc;
+    uint16_t receive_crc;
+    if ((Frame[0] != Mesg_Head) || (Frame[13] != Mesg_Tail))
+        return 0U;
+    crc = CRC16_calculate((uint8_t *)Frame, 11U);
+    receive_crc = (uint16_t)(((uint16_t)Frame[11] << 8U) | Frame[12]);
+    return (crc == receive_crc) ? 1U : 0U;
+}
+
+static void Relay_TransmitToAndroid(const uint8_t *Data, uint16_t Len)
+{
+    if ((Data == NULL) || (Len == 0U))
+        return;
+    (void)HAL_UART_Transmit(&huart3, (uint8_t *)Data, Len, 100U);
+}
+
+static void Relay_TransmitToMainBoard(const uint8_t *Data, uint16_t Len)
+{
+    if ((Data == NULL) || (Len == 0U))
+        return;
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)Data, Len, 100U);
+}
+
+static uint8_t LocalDedupe_IsRepeat(uint8_t ID, uint8_t Code2)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t oldest_age = 0U;
+    uint8_t oldest_index = 0U;
+    uint8_t i;
+
+    for (i = 0U; i < LOCAL_DEDUP_COUNT; i++)
     {
-        switch (mesg->Code2)
+        if ((LocalDedupe[i].Valid != 0U) && (LocalDedupe[i].ID == ID) &&
+            (LocalDedupe[i].Code2 == Code2) && ((now - LocalDedupe[i].Tick) <= LOCAL_DEDUP_TIME_MS))
         {
-        /// 数码管
-        case 0x01:
-            uint32_t data = mesg->Data1 << 24 | mesg->Data2 << 16 | mesg->Data3 << 8 | mesg->Data4;
-            DigitalTube.Set_Num(&DigitalTube, 0, data, 4);
-            DigitalTube.Refresh(&DigitalTube);
+            /* 重发包继续刷新时间窗，但只返回ACK，不重复执行。 */
+            LocalDedupe[i].Tick = now;
+            return 1U;
+        }
+    }
+
+    for (i = 0U; i < LOCAL_DEDUP_COUNT; i++)
+    {
+        if (LocalDedupe[i].Valid == 0U)
+        {
+            oldest_index = i;
             break;
-            /// 灯带亮度
-        case 0x02:
-            LightBelt_Lightness = mesg->Data4;
-            break;
-            /// 场景
-        case 0x03:
-            Scene = (Scene_t)mesg->Data4;
-            break;
-            /// 灯板亮度
-        case 0x04:
-            LightBoard_Lightness = mesg->Data4;
-            Light1.Init = true;
-            Light2.Init = true;
-            break;
-        default:
-            break;
+        }
+        if ((now - LocalDedupe[i].Tick) >= oldest_age)
+        {
+            oldest_age = now - LocalDedupe[i].Tick;
+            oldest_index = i;
+        }
+    }
+
+    LocalDedupe[oldest_index].Valid = 1U;
+    LocalDedupe[oldest_index].ID = ID;
+    LocalDedupe[oldest_index].Code2 = Code2;
+    LocalDedupe[oldest_index].Tick = now;
+    return 0U;
+}
+
+static void Motor2_SetCompare(uint32_t Channel, uint16_t Percent)
+{
+    uint32_t compare = ((uint32_t)htim3.Init.Period * Percent) / 100U;
+    __HAL_TIM_SET_COMPARE(&htim3, Channel, compare);
+}
+
+static void Motor2_RunForward(void)
+{
+    /* 硬件定义：PA6/TIM3_CH1接FI，PA7/TIM3_CH2接BI。 */
+    Motor2_SetCompare(TIM_CHANNEL_1, MOTOR2_SPEED);
+    Motor2_SetCompare(TIM_CHANNEL_2, 0U);
+    Motor2RuntimeTick = HAL_GetTick();
+    Motor2State = MOTOR2_STATE_BUSY;
+}
+
+static void Motor2_RunReverse(void)
+{
+    Motor2_SetCompare(TIM_CHANNEL_1, 0U);
+    Motor2_SetCompare(TIM_CHANNEL_2, MOTOR2_SPEED);
+}
+
+static void Motor2_Brake(void)
+{
+    /* 与原球盘Motor_Stop保持一致：两路均拉到100%作为停止制动。 */
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, htim3.Init.Period);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, htim3.Init.Period);
+}
+
+static void Motor2_LosePower(void)
+{
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0U);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0U);
+}
+
+static void Motor2_Stop(uint8_t ReportRemaining)
+{
+    Motor2_Brake();
+    Motor2State = MOTOR2_STATE_IDLE;
+    Motor2RemainingCount = 0U;
+    Motor2RetryCount = 0U;
+    Motor2PulseStarted = 0U;
+    Motor2StopRequested = 0U;
+    if (ReportRemaining != 0U)
+        Motor2RemainingReportPending = 1U;
+}
+
+static void Motor2_StopForRawMode(void)
+{
+    /* OTA透明模式期间不允许插入本地上报，直接断开电机输出。 */
+    Motor2_LosePower();
+    Motor2State = MOTOR2_STATE_IDLE;
+    Motor2RemainingCount = 0U;
+    Motor2RetryCount = 0U;
+    Motor2PulseStarted = 0U;
+    Motor2StopRequested = 0U;
+    Motor2RemainingReportPending = 0U;
+    Motor2TimeoutReportPending = 0U;
+}
+
+static void Motor2_AddOutput(uint16_t Num)
+{
+    Motor2RemainingCount = (uint16_t)(Motor2RemainingCount + Num);
+    if (Motor2RemainingCount != 0U)
+    {
+        Motor2RetryCount = 0U;
+        Motor2StopRequested = 0U;
+        Motor2_RunForward();
+    }
+    Motor2RemainingReportPending = 1U;
+}
+
+static void Motor2_Task(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (Motor2StopRequested != 0U)
+    {
+        Motor2_Stop(0U);
+        Motor2RemainingReportPending = 1U;
+        return;
+    }
+
+    if (Motor2State == MOTOR2_STATE_BUSY)
+    {
+        if ((now - Motor2RuntimeTick) > MOTOR2_TIMEOUT_MS)
+        {
+            /* 超时后先断电1ms，再按原球盘策略反转300ms。 */
+            Motor2_LosePower();
+            Motor2PhaseTick = now;
+            Motor2State = MOTOR2_STATE_REVERSE_DELAY;
+        }
+    }
+    else if (Motor2State == MOTOR2_STATE_REVERSE_DELAY)
+    {
+        if ((now - Motor2PhaseTick) >= MOTOR2_REVERSE_DELAY_MS)
+        {
+            Motor2_RunReverse();
+            Motor2PhaseTick = now;
+            Motor2State = MOTOR2_STATE_REVERSING;
+        }
+    }
+    else if (Motor2State == MOTOR2_STATE_REVERSING)
+    {
+        if ((now - Motor2PhaseTick) > MOTOR2_REVERSE_MS)
+        {
+            if (Motor2RetryCount < MOTOR2_RETRY_TIMES)
+            {
+                Motor2RetryCount++;
+                Motor2_RunForward();
+            }
+            else
+            {
+                Motor2_Brake();
+                Motor2State = MOTOR2_STATE_IDLE;
+                Motor2TimeoutReportPending = 1U;
+            }
         }
     }
 }
 
-///====================================================================================
-
-/// 发送消息，无重传
-static uint8_t USART_SendMesg(Tx_HandleTypeDef *Tx, Mesg_TypeDef *mesg)
+void Comm_HoolleOutput2IRQ(void)
 {
-    static uint8_t ID = 0;
-    uint8_t data[14];
+    if (HAL_GPIO_ReadPin(HoolleOutput2_GPIO_Port, HoolleOutput2_Pin) == GPIO_PIN_RESET)
+    {
+        /* 光眼低电平开始：使用1MHz TIM2统计脉宽，并重置无出珠超时。 */
+        __HAL_TIM_SET_COUNTER(&htim2, 0U);
+        Motor2PulseStarted = 1U;
+        Motor2RuntimeTick = HAL_GetTick();
+        return;
+    }
+
+    if (Motor2PulseStarted == 0U)
+        return;
+
+    Motor2PulseStarted = 0U;
+    if (__HAL_TIM_GET_COUNTER(&htim2) <= MOTOR2_VALID_PULSE_US)
+        return;
+
+    if (Motor2RemainingCount > 0U)
+    {
+        Motor2RemainingCount--;
+        Motor2RetryCount = 0U;
+        Motor2RemainingReportPending = 1U;
+        if (Motor2RemainingCount == 0U)
+        {
+            /* 中断里只置请求，PWM寄存器操作放回主循环执行。 */
+            Motor2StopRequested = 1U;
+        }
+    }
+}
+
+static void Relay_SendLocalFrame(uint8_t Code2, uint16_t Value)
+{
+    uint8_t data[RELAY_FRAME_LEN] = {0};
     uint16_t crc;
-
-    ID++;               // 每次发送新消息都会自增
-    mesg->ResendID = 0; // 重发次数清零
-    mesg->ID = ID;      // 赋予新ID号
-    memcpy(data, mesg, 14);
-    crc = CRC16_calculate(data, 11);
-    data[11] = crc >> 8;
-    data[12] = crc;
-    // Tx->Transimit(&Tx, data, 14);
-    HAL_UART_Transmit(Tx->huart, data, 14, 100);
-    return ID;
+    RelayTxID++;
+    data[0] = Mesg_Head;
+    data[2] = RelayTxID;
+    data[3] = Relay_to_Android;
+    data[4] = Code2;
+    data[7] = (uint8_t)(Value >> 8U);
+    data[8] = (uint8_t)Value;
+    crc = CRC16_calculate(data, 11U);
+    data[11] = (uint8_t)(crc >> 8U);
+    data[12] = (uint8_t)crc;
+    data[13] = Mesg_Tail;
+    Relay_TransmitToAndroid(data, RELAY_FRAME_LEN);
 }
-/// 填入参数发送消息，无重传
-uint8_t Comm_SendMesg_FillData(Tx_HandleTypeDef *Tx, uint8_t code_1, uint8_t code_2, uint32_t data, uint8_t expandCode)
+
+static void Motor2_ReportTask(void)
 {
-    Mesg_TypeDef mesg = {0};
-    mesg.Head = Mesg_Head;
-    mesg.ResendID = 0;
-    mesg.ID = 0;
-    mesg.Code1 = code_1;
-    mesg.Code2 = code_2;
-    mesg.Data1 = (uint8_t)(data >> 24);
-    mesg.Data2 = (uint8_t)(data >> 16);
-    mesg.Data3 = (uint8_t)(data >> 8);
-    mesg.Data4 = (uint8_t)(data);
-    mesg.ACKbyte = 0x00;
-    mesg.ExpandCode = expandCode;
-    mesg.Tail = Mesg_Tail;
-    return USART_SendMesg(Tx, &mesg);
+    uint16_t remaining;
+    if (RelayMode != RELAY_MODE_NORMAL)
+        return;
+
+    if (Motor2RemainingReportPending != 0U)
+    {
+        Motor2RemainingReportPending = 0U;
+        remaining = Motor2RemainingCount;
+        Relay_SendLocalFrame(Motor2Remaining, remaining);
+    }
+    if (Motor2TimeoutReportPending != 0U)
+    {
+        Motor2TimeoutReportPending = 0U;
+        remaining = Motor2RemainingCount;
+        Relay_SendLocalFrame(Motor2Timeout, remaining);
+    }
 }
 
-/*
- * ----------通信初始化----------
- */
+static uint8_t Relay_IsBootRequest(const uint8_t *Frame)
+{
+    uint32_t data;
+    if ((Frame[3] != Android_to_Board) || (Frame[4] != BoardRestart))
+        return 0U;
+    data = ((uint32_t)Frame[5] << 24U) | ((uint32_t)Frame[6] << 16U) |
+           ((uint32_t)Frame[7] << 8U) | (uint32_t)Frame[8];
+    return (data == OTA_REQUEST_MAGIC) ? 1U : 0U;
+}
+
+static void Relay_EnterRawMode(void)
+{
+    /* BOTA帧已经先转给主板；后续Bootloader流量全部按原始字节透明转发。 */
+    Motor2_StopForRawMode();
+    RelayMode = RELAY_MODE_RAW;
+    RawModeEnterTick = HAL_GetTick();
+    RawProbeIndex = 0U;
+    AndroidFrameIndex = 0U;
+}
+
+static void Relay_HandleLocalFrame(const uint8_t *Frame)
+{
+    uint16_t num;
+    if ((Frame[4] != Motor2Output) && (Frame[4] != Motor2Stop))
+    {
+        /* Code1属于转发板但功能码未知时不下发给原主板，避免协议串扰。 */
+        return;
+    }
+
+    /* 与原主板ACK行为一致：合法命令先原样回发，再做去重判断。 */
+    Relay_TransmitToAndroid(Frame, RELAY_FRAME_LEN);
+    if (LocalDedupe_IsRepeat(Frame[2], Frame[4]) != 0U)
+        return;
+
+    if (Frame[4] == Motor2Output)
+    {
+        num = (uint16_t)(((uint16_t)Frame[7] << 8U) | Frame[8]);
+        Motor2_AddOutput(num);
+    }
+    else
+    {
+        Motor2_Stop(1U);
+    }
+}
+
+static void Relay_HandleAndroidFrame(const uint8_t *Frame)
+{
+    if (Frame[3] == Android_to_Relay)
+    {
+        Relay_HandleLocalFrame(Frame);
+        return;
+    }
+
+    if ((Frame[3] == Android_to_Board) && (Frame[4] == StopAllDevice))
+    {
+        /* 原0xFF仍原样发给主板，同时本地停止第二组吐珠电机。 */
+        Motor2_Stop(0U);
+    }
+
+    Relay_TransmitToMainBoard(Frame, RELAY_FRAME_LEN);
+    if (Relay_IsBootRequest(Frame) != 0U)
+        Relay_EnterRawMode();
+}
+
+static void Relay_ProcessAndroidNormal(void)
+{
+    uint8_t data;
+    uint16_t process_count = 0U;
+
+    while ((process_count < UART_FORWARD_CHUNK) && (ByteQueue_Pop(&AndroidRxQueue, &data) != 0U))
+    {
+        process_count++;
+        if (AndroidFrameIndex == 0U)
+        {
+            if (data == Mesg_Head)
+            {
+                AndroidFrame[0] = data;
+                AndroidFrameIndex = 1U;
+            }
+            else
+            {
+                Relay_TransmitToMainBoard(&data, 1U);
+            }
+            continue;
+        }
+
+        AndroidFrame[AndroidFrameIndex++] = data;
+        if (AndroidFrameIndex >= RELAY_FRAME_LEN)
+        {
+            if (Relay_FrameVerify(AndroidFrame) != 0U)
+                Relay_HandleAndroidFrame(AndroidFrame);
+            else
+                /* 非法或非本协议数据也必须原样转发，保证透明性。 */
+                Relay_TransmitToMainBoard(AndroidFrame, RELAY_FRAME_LEN);
+
+            AndroidFrameIndex = 0U;
+            if (RelayMode == RELAY_MODE_RAW)
+                break;
+        }
+    }
+}
+
+static void Relay_ProbeRawMainByte(uint8_t Data)
+{
+    uint8_t next_head = 0U;
+    uint8_t i;
+
+    if ((HAL_GetTick() - RawModeEnterTick) < RAW_EXIT_MIN_TIME_MS)
+        return;
+
+    if (RawProbeIndex == 0U)
+    {
+        if (Data == Mesg_Head)
+        {
+            RawProbeFrame[0] = Data;
+            RawProbeIndex = 1U;
+        }
+        return;
+    }
+
+    RawProbeFrame[RawProbeIndex++] = Data;
+    if (RawProbeIndex < RELAY_FRAME_LEN)
+        return;
+
+    if ((Relay_FrameVerify(RawProbeFrame) != 0U) && (RawProbeFrame[3] == Board_to_Android))
+    {
+        /* 主板APP恢复并重新发出正常14字节帧后，退出Bootloader透明模式。 */
+        RelayMode = RELAY_MODE_NORMAL;
+        RawProbeIndex = 0U;
+        return;
+    }
+
+    for (i = 1U; i < RELAY_FRAME_LEN; i++)
+    {
+        if (RawProbeFrame[i] == Mesg_Head)
+        {
+            next_head = i;
+            break;
+        }
+    }
+
+    if (next_head == 0U)
+        RawProbeIndex = 0U;
+    else
+    {
+        RawProbeIndex = (uint8_t)(RELAY_FRAME_LEN - next_head);
+        memmove(RawProbeFrame, &RawProbeFrame[next_head], RawProbeIndex);
+    }
+}
+
+static void Relay_ProcessMainBoardNormal(void)
+{
+    uint8_t data[UART_FORWARD_CHUNK];
+    uint16_t len = ByteQueue_Read(&MainBoardRxQueue, data, sizeof(data));
+    if (len > 0U)
+        Relay_TransmitToAndroid(data, len);
+}
+
+static void Relay_ProcessRaw(void)
+{
+    uint8_t data[UART_FORWARD_CHUNK];
+    uint16_t len;
+    uint16_t i;
+
+    len = ByteQueue_Read(&AndroidRxQueue, data, sizeof(data));
+    if (len > 0U)
+        Relay_TransmitToMainBoard(data, len);
+
+    len = ByteQueue_Read(&MainBoardRxQueue, data, sizeof(data));
+    if (len > 0U)
+    {
+        Relay_TransmitToAndroid(data, len);
+        for (i = 0U; i < len; i++)
+            Relay_ProbeRawMainByte(data[i]);
+    }
+}
+
+uint8_t Comm_SendMesg_FillData(Tx_HandleTypeDef *TxHandle, uint8_t code_1, uint8_t code_2, uint32_t data, uint8_t expandCode)
+{
+    uint8_t frame[RELAY_FRAME_LEN] = {0};
+    uint16_t crc;
+    UART_HandleTypeDef *huart = &huart3;
+
+    LegacyTxID++;
+    frame[0] = Mesg_Head;
+    frame[2] = LegacyTxID;
+    frame[3] = code_1;
+    frame[4] = code_2;
+    frame[5] = (uint8_t)(data >> 24U);
+    frame[6] = (uint8_t)(data >> 16U);
+    frame[7] = (uint8_t)(data >> 8U);
+    frame[8] = (uint8_t)data;
+    frame[10] = expandCode;
+    crc = CRC16_calculate(frame, 11U);
+    frame[11] = (uint8_t)(crc >> 8U);
+    frame[12] = (uint8_t)crc;
+    frame[13] = Mesg_Tail;
+
+    if ((TxHandle != NULL) && (TxHandle->huart != NULL))
+        huart = TxHandle->huart;
+    (void)HAL_UART_Transmit(huart, frame, RELAY_FRAME_LEN, 100U);
+    return LegacyTxID;
+}
+
+uint8_t Comm_SendMesg_FillData_withResend(Tx_HandleTypeDef *TxHandle, uint8_t code_1, uint8_t code_2, uint32_t data, uint8_t expandCode, ListHandle_t *List)
+{
+    /* 旧控台重发接口已不参与新转发逻辑，仅保留链接兼容。 */
+    (void)List;
+    return Comm_SendMesg_FillData(TxHandle, code_1, code_2, data, expandCode);
+}
+
+void Resend_Task(void) {}
+void MesgDeal_Task(void) {}
+
 void CommInit(void)
 {
+    memset(&AndroidRxQueue, 0, sizeof(AndroidRxQueue));
+    memset(&MainBoardRxQueue, 0, sizeof(MainBoardRxQueue));
+    memset(LocalDedupe, 0, sizeof(LocalDedupe));
+    RelayMode = RELAY_MODE_NORMAL;
+    AndroidFrameIndex = 0U;
+    RawProbeIndex = 0U;
 
-    Rx_InitTypeDef Rxinit;
+    /* 保留旧控台全局Tx对象，默认指向安卓侧串口，防止旧文件链接失败。 */
+    memset(&Tx, 0, sizeof(Tx));
+    memset(&Rx, 0, sizeof(Rx));
+    Tx.huart = &huart3;
 
-    Rxinit.huart = &huart3;
-    Rxinit.RingBuf = rx_buffer;
-    Rxinit.RingBuf_Size = sizeof(rx_buffer);
-    Rxinit.Frame_Head = Mesg_Head;
-    Rxinit.Frame_Tail = Mesg_Tail;
-    Rxinit.Receive = Rx_Receive;
-    Rxinit.Verify = USART_ReceiveMesg_Verify;
-    Rxinit.Deal = USART_Deal;
-    Communicate_Rx_Init(&Rx, Rxinit);
+    Motor2RemainingCount = 0U;
+    Motor2RetryCount = 0U;
+    Motor2PulseStarted = 0U;
+    Motor2StopRequested = 0U;
+    Motor2RemainingReportPending = 0U;
+    Motor2TimeoutReportPending = 0U;
+    Motor2State = MOTOR2_STATE_IDLE;
 
-    Tx_InitTypeDef Tx_init;
-    Tx_init.huart = &huart3;
-    Tx_init.hdma = NULL;
-    Tx_init.TxBuf = NULL;
-    Tx_init.TxBuf_Size = 0;
-    Communicate_Tx_Init(&Tx, Tx_init);
+    /* TIM2为1MHz光眼脉宽计时；TIM3_CH1/CH2驱动SS6285L。 */
+    (void)HAL_TIM_Base_Start(&htim2);
+    (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+    (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    Motor2_LosePower();
+
+    /* USART2接原球盘主板，USART3接安卓板。 */
+    (void)HAL_UART_Receive_IT(&huart2, &MainBoardRxByte, 1U);
+    (void)HAL_UART_Receive_IT(&huart3, &AndroidRxByte, 1U);
 }
 
 void CommTask(void)
 {
-    Rx.Receive(&Rx, &Receive_mesg, 14);
+    if (RelayMode == RELAY_MODE_RAW)
+    {
+        Relay_ProcessRaw();
+        return;
+    }
+
+    Relay_ProcessMainBoardNormal();
+    Relay_ProcessAndroidNormal();
+    /* BOTA命令可能在处理安卓帧时切换为RAW，切换后禁止发送任何本地协议帧。 */
+    if (RelayMode == RELAY_MODE_RAW)
+        return;
+
+    Motor2_Task();
+    Motor2_ReportTask();
+}
+
+void Comm_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart2)
+    {
+        (void)ByteQueue_Push(&MainBoardRxQueue, MainBoardRxByte);
+        (void)HAL_UART_Receive_IT(&huart2, &MainBoardRxByte, 1U);
+    }
+    else if (huart == &huart3)
+    {
+        (void)ByteQueue_Push(&AndroidRxQueue, AndroidRxByte);
+        (void)HAL_UART_Receive_IT(&huart3, &AndroidRxByte, 1U);
+    }
+}
+
+void Comm_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    uint32_t error_code;
+    uint8_t *rx_byte = NULL;
+
+    if (huart == &huart2)
+        rx_byte = &MainBoardRxByte;
+    else if (huart == &huart3)
+        rx_byte = &AndroidRxByte;
+    else
+        return;
+
+    error_code = huart->ErrorCode;
+    if ((error_code & (HAL_UART_ERROR_ORE | HAL_UART_ERROR_FE | HAL_UART_ERROR_NE | HAL_UART_ERROR_PE)) == 0U)
+        return;
+
+    /* STM32F1通过先读SR再读DR统一清除PE/FE/NE/ORE，避免串口异常后永久停收。 */
+    __HAL_UART_CLEAR_PEFLAG(huart);
+    if (huart->RxState == HAL_UART_STATE_READY)
+    {
+        huart->ErrorCode = HAL_UART_ERROR_NONE;
+        (void)HAL_UART_Receive_IT(huart, rx_byte, 1U);
+    }
 }

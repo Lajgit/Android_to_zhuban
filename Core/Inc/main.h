@@ -5,20 +5,9 @@
   * @brief          : Header for main.c file.
   *                   This file contains the common defines of the application.
   ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
   */
 /* USER CODE END Header */
 
-/* Define to prevent recursive inclusion -------------------------------------*/
 #ifndef __MAIN_H
 #define __MAIN_H
 
@@ -26,39 +15,25 @@
 extern "C" {
 #endif
 
-/* Includes ------------------------------------------------------------------*/
 #include "stm32f1xx_hal.h"
 
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-
-/* USER CODE END Includes */
-
-/* Exported types ------------------------------------------------------------*/
-/* USER CODE BEGIN ET */
-
-/* USER CODE END ET */
-
-/* Exported constants --------------------------------------------------------*/
-/* USER CODE BEGIN EC */
-
-/* USER CODE END EC */
-
-/* Exported macro ------------------------------------------------------------*/
-/* USER CODE BEGIN EM */
-
-/* USER CODE END EM */
-
-/* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
-/* USER CODE BEGIN EFP */
+/* UART转发板实际硬件定义 */
+#define LED_Pin GPIO_PIN_8
+#define LED_GPIO_Port GPIOB
+#define Motor2_FI_Pin GPIO_PIN_6
+#define Motor2_FI_GPIO_Port GPIOA
+#define Motor2_BI_Pin GPIO_PIN_7
+#define Motor2_BI_GPIO_Port GPIOA
+#define HoolleOutput2_Pin GPIO_PIN_0
+#define HoolleOutput2_GPIO_Port GPIOB
+#define HoolleOutput2_EXTI_IRQn EXTI0_IRQn
 
-/* USER CODE END EFP */
-
-/* Private defines -----------------------------------------------------------*/
-#define LED_Pin GPIO_PIN_13
-#define LED_GPIO_Port GPIOC
+/*
+ * 以下旧控台引脚别名仅用于让原工程中未调用的旧模块继续参与编译。
+ * 新转发板运行路径不会初始化或访问这些旧业务引脚。
+ */
 #define Encoder_A_Pin GPIO_PIN_0
 #define Encoder_A_GPIO_Port GPIOA
 #define Encoder_B_Pin GPIO_PIN_1
@@ -67,12 +42,12 @@ void Error_Handler(void);
 #define Button6_GPIO_Port GPIOA
 #define Button1_Pin GPIO_PIN_5
 #define Button1_GPIO_Port GPIOA
-#define WS2812_1_Pin GPIO_PIN_6
-#define WS2812_1_GPIO_Port GPIOA
-#define Button2_Pin GPIO_PIN_7
-#define Button2_GPIO_Port GPIOA
-#define Button5_Pin GPIO_PIN_0
-#define Button5_GPIO_Port GPIOB
+#define WS2812_1_Pin Motor2_FI_Pin
+#define WS2812_1_GPIO_Port Motor2_FI_GPIO_Port
+#define Button2_Pin Motor2_BI_Pin
+#define Button2_GPIO_Port Motor2_BI_GPIO_Port
+#define Button5_Pin HoolleOutput2_Pin
+#define Button5_GPIO_Port HoolleOutput2_GPIO_Port
 #define WS2812_2_Pin GPIO_PIN_1
 #define WS2812_2_GPIO_Port GPIOB
 #define SPI2_OE_Pin GPIO_PIN_12
@@ -97,10 +72,6 @@ void Error_Handler(void);
 #define KeyBoard4_GPIO_Port GPIOB
 #define Button4_Pin GPIO_PIN_7
 #define Button4_GPIO_Port GPIOB
-
-/* USER CODE BEGIN Private defines */
-
-/* USER CODE END Private defines */
 
 #ifdef __cplusplus
 }
